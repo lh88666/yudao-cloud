@@ -837,4 +837,201 @@ KEY `idx_user_time`           (`user_id`, `deleted`, `status`, `record_time`)   
    ```
 2. **监控**：开启 MySQL slow query log（`long_query_time=1`），按周 review。
 3. **回退**：索引上线后 1 周内观察 `Handler_read_rnd_next`（应下降）；不降则 drop。
+
+---
+
+## 7. 管理后台功能设计
+
+> 本节只覆盖 `yudao-module-bill` 在 admin 端的**业务专属**功能。  
+> yudao 框架自带的管理能力（用户/角色/菜单/字典/日志/短信/邮件/站内信/敏感词/文件/定时任务/配置/API日志/代码生成等）由 `yudao-module-system` + `yudao-module-infra` 提供，**`yudao-server/pom.xml` 解开对应模块依赖即可启用**，不在本节重复设计。
+
+### 7.1 设计原则
+
+1. **admin 只读为主**： 默认情况下 admin 只能查询 C 端用户的数据，**不能代记账、不能改账、不能改用户账本设置**。干预操作（强制删除/禁用）走专门的 `admin_*` 接口，必须二次鉴权 + 操作审计。
+2. **强审计**： 所有 admin 接口的访问记录必须进 `yudao_operate_log`（yudao 自带 `bizlog-sdk` + `@LogRecord` 注解），记录「谁、什么时间、查了谁的什么数据」。
+3. **敏感字段默认脱敏**： 列表展示时 `description` 中段 `****`、手机号/邮箱中间 4 位 `*`，点详情才显示原文。yudao 自带 `PrivacyUtils` 可用。
+4. **强制干预标记化**： 强制删除的账单**不能**和用户自删混为一谈，必须能在审计时区分来源（详见 §7.4 schema 改动）。
+5. **不能批量导出 C 端原始数据**： v1 不提供 admin 端「一键导出某用户全部账单」功能。导出走用户自助 + 数据脱敏，避免法务风险。
+
+### 7.2 P0：基础监管（v1 必做）
+
+所有 P0 接口前缀 `/admin-api/bill/**`，仅 `isAdmin()` 通过的登录用户可访问。
+
+#### 7.2.1 用户账本概览
+
+| 字段 | 值 |
+| --- | --- |
+| 方法 + 路径 | `GET /admin-api/bill/book/list-by-user` |
+| 查询参数 | `userId` 必填、`type` 选填（1 个人 / 2 家庭）、`pageNum` / `pageSize` |
+| 响应 | `List<BookRespVO>`，含账本名称、类型、状态、成员数、账单总数、创建时间 |
+| 权限注解 | `@PreAuthorize("@ss.hasRole('admin')")` |
+| 审计字段 | 操作人、被查询 userId、查询时间 |
+| 备注 | 只读，不可修改 |
+
+#### 7.2.2 账单查询（跨用户）
+
+| 字段 | 值 |
+| --- | --- |
+| 方法 + 路径 | `GET /admin-api/bill/record/page` |
+| 查询参数 | `userId` / `bookId` / `type` / `categoryId` / `startTime` / `endTime` / `minAmount` / `maxAmount` / `keyword` / `pageNum` / `pageSize` |
+| 响应 | `PageResult<RecordRespVO>`，含 `creatorInfo`（记账人昵称/头像）、`bookName`、`categoryName`、`description`（**列表脱敏**） |
+| 权限注解 | `@PreAuthorize("@ss.hasRole('admin')")` |
+| 审计字段 | 操作人、查询条件全量记录 |
+| 备注 | 响应体大小限制 `maxPageSize=100`；超大数据用 `EXPORT_ASYNC` 走异步导出（v2） |
+
+#### 7.2.3 账单详情查看
+
+| 字段 | 值 |
+| --- | --- |
+| 方法 + 路径 | `GET /admin-api/bill/record/get?id=` |
+| 响应 | `RecordRespVO` 全字段，**`description` 明文** |
+| 权限注解 | `@PreAuthorize("@ss.hasRole('admin')")` |
+| 审计字段 | 操作人、被查看账单 id、查看时间 |
+| 备注 | 详情接口访问必须记录，列表查询与详情查询**分开审计**（详查询询是敏感操作） |
+
+#### 7.2.4 用户分类查看
+
+| 字段 | 值 |
+| --- | --- |
+| 方法 + 路径 | `GET /admin-api/bill/category/list-by-user?userId=` |
+| 响应 | `List<CategoryRespVO>`，区分 `builtin=1` / `builtin=0` |
+| 权限注解 | `@PreAuthorize("@ss.hasRole('admin')")` |
+| 备注 | 用于运营分析（用户偏好）、违规识别（如分类名含敏感词） |
+
+#### 7.2.5 系统预置分类维护
+
+| 字段 | 值 |
+| --- | --- |
+| 方法 + 路径 | `PUT /admin-api/bill/category/system/update` |
+| 入参 | 修改 §2.5 默认分类的名称 / icon / sort；不能删除（避免老用户 seed 缺失） |
+| 权限注解 | `@PreAuthorize("@ss.hasRole('admin')")` + `@LogRecord("更新系统预置分类")` |
+| 影响范围 | **只影响后续新注册用户**，存量用户已 seed 的数据**不动**（与 §2.5 升级 seed 逻辑保持一致） |
+
+#### 7.2.6 仪表盘数据
+
+| 字段 | 值 |
+| --- | --- |
+| 方法 + 路径 | `GET /admin-api/bill/statistics/dashboard` |
+| 响应 | `{ totalUsers, todayActiveUsers, monthlyActiveUsers, totalBooks, totalRecords, todayRecords, todayAmount, monthlyAmount, topCategories: [{categoryId, name, count, amount}] }` |
+| 备注 | 聚合 SQL 走 5+ 表 JOIN，**性能敏感**；建议加 Redis 缓存 5 分钟，或建宽表定时刷新（性能优化阶段处理） |
+
+### 7.3 P1：干预能力（v1 视情况）
+
+P1 接口**默认关闭**（不暴露路由、不写 Service 方法），待运营有明确诉求再启用。每启用一项必须配套：
+
+- 二次鉴权（角色 + 操作原因必填）
+- 操作日志（强制记录原因 + 操作人 + 被操作对象）
+- 数据备份（操作前先快照到 `*_snapshot` 表，30 天后可清理）
+
+#### 7.3.1 账单强制删除
+
+| 字段 | 值 |
+| --- | --- |
+| 方法 + 路径 | `DELETE /admin-api/bill/record/force-delete?id=` |
+| 入参 | `reason` 必填（≥ 5 字） |
+| 行为 | `deleted=1` + 写入 §7.4 schema 改动中的强制删除字段 |
+| 权限注解 | `@PreAuthorize("@ss.hasRole('admin') and @ss.hasAuthority('bill:admin:force-delete')")` |
+| 备注 | 普通列表不展示被 admin 强制删除的账单；用户侧「回收站」也不可见 |
+
+#### 7.3.2 账本禁用
+
+| 字段 | 值 |
+| --- | --- |
+| 方法 + 路径 | `PUT /admin-api/bill/book/admin-disable` |
+| 入参 | `bookId` + `reason` |
+| 行为 | §7.4 schema 中加 `admin_disabled_*` 字段；账本所有 C 端写接口前置校验该字段 |
+| 备注 | 仅家庭账本允许禁用（个人账本直接封禁用户即可） |
+
+#### 7.3.3 冻结用户记账
+
+| 字段 | 值 |
+| --- | --- |
+| 方法 + 路径 | `PUT /admin-api/bill/user-freeze` |
+| 入参 | `userId` + `reason` + `expireTime` |
+| 行为 | 新建 `bill_user_freeze` 表（或 `system_users` 加 freeze 字段）；所有 C 端记账接口前置校验 |
+| 备注 | 冻结期间用户可查看历史账单，但不可新增/修改/删除 |
+
+#### 7.3.4 邀请链接强制撤销
+
+| 字段 | 值 |
+| --- | --- |
+| 方法 + 路径 | `PUT /admin-api/bill/invite-link/admin-revoke?id=` |
+| 行为 | 复用 §5 表的 `status=0`，但记录撤销人为 admin 而非户主 |
+| 备注 | 与户主撤销走相同字段，靠 `updater` 区分操作人 |
+
+### 7.4 P1 配套 Schema 改动（待启用 P1 时统一迁移）
+
+> ⚠️ 这些字段**不进首版 DDL**。等到 P1 任一功能启用时，与对应 Service 实现一起 ALTER 进库。
+
+#### 7.4.1 `bill_record` 新增字段
+
+```sql
+ALTER TABLE bill_record
+  ADD COLUMN `admin_delete_flag`     TINYINT      NOT NULL DEFAULT 0      COMMENT '是否被 admin 强制删除：0=否 1=是',
+  ADD COLUMN `admin_delete_user_id`  BIGINT                DEFAULT NULL   COMMENT '强制删除操作人 user_id',
+  ADD COLUMN `admin_delete_time`     DATETIME              DEFAULT NULL   COMMENT '强制删除时间',
+  ADD COLUMN `admin_delete_reason`   VARCHAR(255)          DEFAULT NULL   COMMENT '强制删除原因';
+```
+
+应用层逻辑：`deleted=0` AND `admin_delete_flag=0` 才在用户侧可见；admin 端可见全部。
+
+#### 7.4.2 `bill_book` 新增字段
+
+```sql
+ALTER TABLE bill_book
+  ADD COLUMN `admin_disabled_flag`     TINYINT      NOT NULL DEFAULT 0      COMMENT '是否被 admin 禁用：0=否 1=是',
+  ADD COLUMN `admin_disabled_user_id`  BIGINT                DEFAULT NULL   COMMENT '禁用操作人 user_id',
+  ADD COLUMN `admin_disabled_time`     DATETIME              DEFAULT NULL   COMMENT '禁用时间',
+  ADD COLUMN `admin_disabled_reason`   VARCHAR(255)          DEFAULT NULL   COMMENT '禁用原因';
+```
+
+应用层逻辑：`admin_disabled_flag=1` 时，所有 C 端写账本的接口（createBill / updateBill / deleteBill / updateBook / inviteMember 等）统一返回 `BOOK_DISABLED_BY_ADMIN` 错误码。
+
+#### 7.4.3 `bill_book_invite_link` 无需新增字段
+
+靠 `updater` 字段区分户主撤销 vs admin 撤销；审计日志里补 `operator_role=admin|owner` 即可。
+
+### 7.5 P2：运营分析（v2 预留）
+
+| 功能 | 优先级 | 备注 |
+| --- | --- | --- |
+| 用户画像（消费分类 Top 10） | P2 | 走离线数仓，admin 端只看结果宽表 |
+| 异常账本识别 | P2 | 成员数 / 流水金额阈值告警 |
+| 用户自助数据导出 | P2 | 用户在 C 端申请，异步生成加密压缩包 |
+| 家庭账本协作申诉处理 | P2 | 配合 `yudao-module-bpm` 工作流 |
+
+### 7.6 审计与脱敏
+
+#### 7.6.1 操作日志模板（yudao `@LogRecord`）
+
+```java
+@LogRecord(
+    value = "查询用户账单",
+    type = "BILL_RECORD_QUERY",
+    bizId = "#userId",           // 被查询 userId
+    extra = """{
+        |"queryParams": #{T(com.alibaba.fastjson.JSON).toJSONString(#queryParams)},
+        |"resultCount": #{result.total}
+    }""".stripMargin()
+)
+public PageResult<RecordRespVO> adminQueryRecords(RecordQuery query) { ... }
+```
+
+#### 7.6.2 脱敏规则
+
+| 字段 | 列表展示 | 详情展示 |
+| --- | --- | --- |
+| `description` | 中段 4 位 `****` | 明文 |
+| `memberUser.mobile` | `138****1234` | `hasAuthority('bill:admin:view-sensitive')` 才返回明文 |
+| `memberUser.email` | `y****@example.com` | 同上 |
+| 金额 | 完整 | 完整 |
+
+### 7.7 后续 TODO
+
+- [ ] P0 6 个 admin 接口实现 + `@LogRecord` + 二次鉴权
+- [ ] P0 仪表盘聚合查询（5+ 表 JOIN，先实现后优化；性能问题在 §6 索引上线后再说）
+- [ ] 用户自助数据导出（C 端 + admin 双通道）
+- [ ] P1 触发时统一迁移 §7.4 schema 改动
+- [ ] 审计日志查看页（admin 端操作流水可视化）
+- [ ] admin 端敏感字段查看权限分级（普通管理员 vs 超级管理员）
 4. **Service 层去重**：所有 `UNIQUE KEY` 涉及的字段，`insertOrUpdate` 前必须先 `existsByXxx()` 校验，不依赖数据库兜底。
